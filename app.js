@@ -15,8 +15,18 @@ function join(id,host){
  const link=new URL(location.href);link.searchParams.set('room',id);$('invite').href=link.href;$('invite').textContent=link.href;
  if(host&&window.QRCode)new QRCode($('qr'),{text:link.href,width:200,height:200});
  const url=new URL(origin);url.protocol=url.protocol==='https:'?'wss:':'ws:';url.pathname='/room/'+id;
- ws=new WebSocket(url.href);ws.onopen=()=>status('等待另一台裝置加入');ws.onerror=()=>status('配對伺服器連線失敗');ws.onclose=()=>{if(!$('room').hidden)status('配對連線已關閉')};
- ws.onmessage=async e=>{let m;try{m=JSON.parse(e.data)}catch{return}
+ const socket=new WebSocket(url.href);
+ ws=socket;
+ let socketError=false;
+ socket.onopen=()=>status('等待另一台裝置加入');
+ socket.onerror=()=>{socketError=true};
+ socket.onclose=event=>{
+  if(ws!==socket||$('room').hidden)return;
+  const rtc=pc?'WebRTC '+pc.connectionState+'／ICE '+pc.iceConnectionState:'WebRTC 尚未啟動';
+  const before=$('status').textContent;
+  status(`配對連線已關閉（代碼 ${event.code}，${rtc}${socketError?'，WebSocket 發生錯誤':''}）｜關閉前：${before}`);
+ };
+ socket.onmessage=async e=>{if(ws!==socket)return;let m;try{m=JSON.parse(e.data)}catch{return}
   if(m.type==='peer-joined'){status('裝置加入，正在建立連線');await prepare(true)}
   if(m.type==='signal')await signal(m.data);
   if(m.type==='ready'){remoteReady=true;activate()}
@@ -28,7 +38,7 @@ async function prepare(initiator){
  if(pc)return;
  pc=new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}]});
  pc.onicecandidate=e=>{if(e.candidate)send('signal',{data:{candidate:e.candidate}})};
- pc.onconnectionstatechange=()=>{if(pc.connectionState==='failed')status('P2P 連線失敗，此網路可能需要 TURN 中繼')};
+ pc.onconnectionstatechange=()=>{if(ws?.readyState!==WebSocket.CLOSED&&pc.connectionState==='failed')status('P2P 連線失敗，此網路可能需要 TURN 中繼')};
  pc.ondatachannel=e=>channel(e.channel);
  if(initiator){channel(pc.createDataChannel('quickbridge'));const offer=await pc.createOffer();await pc.setLocalDescription(offer);send('signal',{data:{description:pc.localDescription}})}
 }
@@ -49,7 +59,7 @@ async function sas(){
 function channel(c){
  dc=c;dc.binaryType='arraybuffer';
  c.onopen=async()=>{$('sas').textContent='請確認兩端驗證碼相同：'+await sas();$('sas').hidden=false;$('confirm').hidden=false;$('reject').hidden=false;status('等待配對確認')};
- c.onclose=()=>{verified=false;$('transfer').hidden=true;status('傳輸連線已關閉')};
+ c.onclose=()=>{verified=false;$('transfer').hidden=true;if(ws?.readyState!==WebSocket.CLOSED)status('傳輸連線已關閉')};
  c.onmessage=async e=>{
   if(typeof e.data==='string'){
    let m;try{m=JSON.parse(e.data)}catch{return}

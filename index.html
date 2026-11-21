@@ -1,1 +1,59 @@
-<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>QuickBridge｜跨裝置傳檔</title><link rel="stylesheet" href="style.css"></head><body><main><header><h1>QuickBridge</h1><p>免安裝・掃碼配對・跨網路傳檔</p></header><section id="setup"><button id="create">建立直連房間</button> <button id="createRelay">建立 HTTPS 小檔中繼房間（5 MB）</button><p>或在另一台裝置開啟分享連結</p></section><section id="room" hidden><p id="status" role="status">連線中…</p><div id="qr"></div><p><a id="invite" target="_blank" rel="noopener"></a></p><p id="sas" hidden></p><button id="confirm" hidden>確認配對碼相同</button><button id="reject" hidden>拒絕配對</button><button id="leave">結束房間</button></section><section id="transfer" hidden><h2>傳送文字</h2><textarea id="text" placeholder="輸入文字或網址"></textarea><button id="sendText">傳送文字</button><h2>傳送檔案</h2><input id="file" type="file"><button id="sendFile">傳送檔案</button><progress id="progress" max="100" value="0"></progress><h2>接收內容</h2><div id="received"></div></section><footer>HTTPS 中繼會暫存在記憶體中的加密資料，供對方取回。請勿在公用電腦傳送機密資料。</footer></main><script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script><script src="config.js"></script><script src="app.js?v=https-relay1"></script></body></html>
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#f5f3ed">
+  <title>QuickBridge｜跨裝置傳檔</title>
+  <link rel="stylesheet" href="style.css?v=studio1">
+</head>
+<body>
+<main>
+  <header class="mast"><span class="mark" aria-hidden="true">⇄</span><strong>QuickBridge</strong></header>
+  <section id="setup">
+    <div class="intro">
+      <div><h1>跨裝置傳檔<span>。</span></h1><p>在這台裝置建立房間，用另一台掃碼加入。</p></div>
+      <div class="devices" aria-hidden="true"><i class="laptop"></i><b>⇄</b><i class="phone"></i></div>
+    </div>
+    <div class="choices">
+      <article class="choice primary"><h2>小檔中繼</h2><p>手機用 5G 也能傳。透過 HTTPS 傳送文字、照片或單檔 5 MB 以內的檔案。</p><button id="createRelay">建立 HTTPS 小檔中繼房間 <span aria-hidden="true">↗</span></button></article>
+      <article class="choice"><h2>點對點直連</h2><p>透過 WebRTC 在兩台裝置間直傳，單檔上限 20 MB。連線能力依網路環境而異。</p><button class="secondary" id="create">建立直連房間 <span aria-hidden="true">↗</span></button></article>
+    </div>
+  </section>
+  <section id="room" class="panel" hidden>
+    <div class="row"><h2>傳輸房間</h2><button id="leave" class="quiet">結束房間</button></div>
+    <p id="status" role="status">連線中…</p>
+    <div class="invitation"><div id="qr"></div>
+      <div class="invite-actions"><button id="copyInvite" class="secondary">複製邀請連結</button>
+        <details><summary>顯示完整連結</summary><a id="invite" target="_blank" rel="noopener noreferrer"></a></details>
+        <small id="copyResult" role="status"></small>
+      </div>
+    </div>
+    <p id="sas" hidden></p><button id="confirm" hidden>確認配對碼相同</button> <button id="reject" class="secondary" hidden>拒絕配對</button>
+  </section>
+  <section id="transfer" hidden>
+    <div class="choices">
+      <article class="panel"><h2><label for="file">傳送檔案</label></h2><input id="file" type="file"><button id="sendFile">傳送檔案</button><progress id="progress" aria-label="檔案送出進度" max="100" value="0"></progress></article>
+      <article class="panel"><h2><label for="text">傳送文字</label></h2><textarea id="text" placeholder="輸入文字或貼上網址"></textarea><button id="sendText" class="secondary">傳送文字</button></article>
+    </div>
+    <article class="panel inbox"><h2>接收內容</h2><div id="received" aria-live="polite"></div></article>
+  </section>
+  <footer>HTTPS 中繼會暫存加密資料，供另一端取回。請只與接收者分享房間連結。</footer>
+</main>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<script src="config.js"></script><script src="app.js?v=https-relay1"></script>
+<script>
+const copyResult = document.getElementById('copyResult');
+document.getElementById('copyInvite').onclick = async () => {
+  const invite = document.getElementById('invite');
+  try {
+    await navigator.clipboard.writeText(invite.href);
+    copyResult.textContent = '已複製，可以傳給另一台裝置。';
+  } catch {
+    invite.closest('details').open = true;
+    copyResult.textContent = '請長按或選取連結複製。';
+  }
+};
+document.getElementById('leave').addEventListener('click', () => { copyResult.textContent = ''; });
+</script>
+</body></html>

@@ -19,7 +19,7 @@ function join(id,host,secret=''){
  const link=new URL(location.href);link.searchParams.set('room',id);if(secret){link.searchParams.set('relay','1');link.hash=secret;}$('invite').href=link.href;$('invite').textContent=link.href;
  if(host&&window.QRCode)new QRCode($('qr'),{text:link.href,width:200,height:200});
  const url=new URL(origin);url.protocol=url.protocol==='https:'?'wss:':'ws:';url.pathname=(secret?'/relay/':'/room/')+id;
- const socket=new WebSocket(url.href);
+ const socket=secret?httpsRelay(origin,id,host):new WebSocket(url.href);
  ws=socket;
  let socketError=false;
  socket.onopen=()=>status('等待另一台裝置加入');
@@ -27,7 +27,7 @@ function join(id,host,secret=''){
  socket.onclose=event=>{
   if(ws!==socket||$('room').hidden)return;
   if(secret){verified=false;incoming=null;for(const name of ['transfer','confirm','reject','sas'])$(name).hidden=true;}
-  const rtc=secret?'小檔中繼':pc?'WebRTC '+pc.connectionState+'／ICE '+pc.iceConnectionState:'WebRTC 尚未啟動';
+  const rtc=secret?'HTTPS 中繼 '+(event.reason||''):pc?'WebRTC '+pc.connectionState+'／ICE '+pc.iceConnectionState:'WebRTC 尚未啟動';
   const before=$('status').textContent;
   if(secret&&event.code===1000&&event.reason==='Peer left')return;
   status(`配對連線已關閉（代碼 ${event.code}，${rtc}${socketError?'，WebSocket 發生錯誤':''}）｜關閉前：${before}`);
@@ -40,6 +40,58 @@ function join(id,host,secret=''){
   if(m.type==='reject'){status('對方拒絕配對');reset()}
   if(m.type==='peer-left'){status('對方已離線');pc?.close();$('transfer').hidden=true}
  };
+}
+
+
+function httpsRelay(origin,id,host){
+ const url=new URL('/http-relay/'+id,origin);
+ const role=host?'host':'guest',token=random(32);
+ const pending=[];
+ let seq=0,ack=0,joined=false,paired=false,failures=0;
+ const relay={
+  readyState:0,bufferedAmount:0,
+  send(packet){
+   if(relay.readyState!==1)throw Error('HTTPS 中繼已關閉');
+   const frame=btoa(String.fromCharCode(...packet));
+   pending.push(frame);relay.bufferedAmount+=frame.length;
+  },
+  close(){
+   if(relay.readyState===3)return;
+   relay.readyState=3;
+   if(joined)fetch(url,{method:'POST',body:JSON.stringify({role,token,leave:true}),keepalive:true}).catch(()=>{});
+  }
+ };
+ const notify=message=>relay.onmessage?.({data:JSON.stringify(message)});
+ async function poll(){
+  if(relay.readyState===3)return;
+  const frames=pending.slice(0,8);
+  let downloading=false;
+  try{
+   const response=await fetch(url,{method:'POST',cache:'no-store',body:JSON.stringify({role,token,join:!joined,seq,ack,frames}),signal:AbortSignal.timeout(15000)});
+   if(relay.readyState===3)return;
+   if(!response.ok){
+    if(response.status>=500||response.status===429)throw Error('HTTP '+response.status);
+    relay.readyState=3;relay.onclose?.({code:response.status,reason:'HTTP'});return;
+   }
+   const result=await response.json();
+   if(relay.readyState===3)return;
+   failures=0;
+   downloading=result.frames.length===8;
+   if(!joined){joined=true;relay.readyState=1;relay.onopen?.();notify({type:'role',role})}
+   if(result.paired&&!paired){paired=true;notify({type:'peer-joined'})}
+   pending.splice(0,frames.length);seq+=frames.length;
+   for(const frame of frames)relay.bufferedAmount-=frame.length;
+   for(const frame of result.frames){
+    relay.onmessage?.({data:Uint8Array.from(atob(frame),c=>c.charCodeAt(0)).buffer});ack++;
+   }
+  }catch(error){
+   if(relay.readyState===3)return;
+   if(++failures>=4){relay.readyState=3;relay.onclose?.({code:0,reason:'HTTPS 連續四次無回應'});return}
+  }
+  setTimeout(poll,failures?1000*failures:(pending.length||downloading)?0:paired?650:1200);
+ }
+ setTimeout(poll,0);
+ return relay;
 }
 
 function openRelay(socket,secret,id){
@@ -97,7 +149,7 @@ function openRelay(socket,secret,id){
      const code=Array.from(new Uint8Array(digest,0,4),x=>x.toString(16).padStart(2,'0')).join('').toUpperCase();
      $('sas').textContent='請確認兩端驗證碼相同：'+code;
      for(const name of ['sas','confirm','reject'])$(name).hidden=false;
-     status('中繼已連線，等待配對確認');
+     status('HTTPS 中繼已連線，等待配對確認');
     }
     return;
    }

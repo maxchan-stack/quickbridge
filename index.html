@@ -6,6 +6,13 @@
   <meta name="theme-color" content="#f5f3ed">
   <title>QuickBridge｜跨裝置傳檔</title>
   <link rel="stylesheet" href="style.css?v=studio1">
+  <style>
+    .choices.mode-picker{grid-template-columns:1fr}
+    .direct-option{padding:8px 2px}
+    .direct-option p{margin:12px 0}
+    #switchRelay{margin-bottom:16px}
+    main:has(#transfer:not([hidden])) #switchRelay{display:none}
+  </style>
 </head>
 <body>
 <main>
@@ -15,14 +22,15 @@
       <div><h1>跨裝置傳檔<span>。</span></h1><p>在這台裝置建立房間，用另一台掃碼加入。</p></div>
       <div class="devices" aria-hidden="true"><i class="laptop"></i><b>⇄</b><i class="phone"></i></div>
     </div>
-    <div class="choices">
+    <div class="choices mode-picker">
       <article class="choice primary"><h2>小檔中繼</h2><p>手機用 5G 也能傳。透過 HTTPS 傳送文字、照片或單檔 5 MB 以內的檔案。</p><button id="createRelay">建立 HTTPS 小檔中繼房間 <span aria-hidden="true">↗</span></button></article>
-      <article class="choice"><h2>點對點直連</h2><p>透過 WebRTC 在兩台裝置間直傳，單檔上限 20 MB。連線能力依網路環境而異。</p><button class="secondary" id="create">建立直連房間 <span aria-hidden="true">↗</span></button></article>
+      <details class="direct-option"><summary>其他傳輸方式 · 點對點直連</summary><p>僅限兩端可建立 WebRTC 直連時使用，單檔上限 20 MB。</p><button class="secondary" id="create">嘗試建立直連房間</button></details>
     </div>
   </section>
   <section id="room" class="panel" hidden>
     <div class="row"><h2>傳輸房間</h2><button id="leave" class="quiet">結束房間</button></div>
     <p id="status" role="status">連線中…</p>
+    <button id="switchRelay" class="secondary" hidden>改建 HTTPS 小檔中繼房間</button>
     <div class="invitation"><div id="qr"></div>
       <div class="invite-actions"><button id="copyInvite" class="secondary">複製邀請連結</button>
         <details><summary>顯示完整連結</summary><a id="invite" target="_blank" rel="noopener noreferrer"></a></details>
@@ -43,6 +51,15 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 <script src="config.js"></script><script src="app.js?v=https-relay1"></script>
 <script>
+const switchRelay = document.getElementById('switchRelay');
+document.getElementById('create').addEventListener('click', () => { switchRelay.hidden = false; });
+for (const id of ['leave', 'createRelay']) {
+  document.getElementById(id).addEventListener('click', () => { switchRelay.hidden = true; });
+}
+switchRelay.onclick = () => {
+  document.getElementById('leave').click();
+  document.getElementById('createRelay').click();
+};
 const copyResult = document.getElementById('copyResult');
 document.getElementById('copyInvite').onclick = async () => {
   const invite = document.getElementById('invite');

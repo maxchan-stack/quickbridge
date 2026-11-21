@@ -29,6 +29,7 @@ function join(id,host,secret=''){
   if(secret){verified=false;incoming=null;for(const name of ['transfer','confirm','reject','sas'])$(name).hidden=true;}
   const rtc=secret?'小檔中繼':pc?'WebRTC '+pc.connectionState+'／ICE '+pc.iceConnectionState:'WebRTC 尚未啟動';
   const before=$('status').textContent;
+  if(secret&&event.code===1000&&event.reason==='Peer left')return;
   status(`配對連線已關閉（代碼 ${event.code}，${rtc}${socketError?'，WebSocket 發生錯誤':''}）｜關閉前：${before}`);
  };
  if(secret){openRelay(socket,secret,id);return;}
@@ -177,7 +178,18 @@ $('sendFile').onclick=async()=>{
  try{await channel.send(JSON.stringify({type:'file-start',name:f.name,size:f.size}));let offset=0;while(offset<f.size){await drain(channel);const b=await f.slice(offset,offset+chunk).arrayBuffer();await channel.send(b);offset+=b.byteLength;$('progress').value=Math.round(offset/f.size*100)}await drain(channel);await channel.send(JSON.stringify({type:'file-end'}));status('已送出檔案，等待接收端下載')}catch(e){status('傳送失敗：'+e.message)}finally{$('sendFile').disabled=false}
 };
 const query=new URLSearchParams(location.search),id=query.get('room');
-if(id){
- if(query.get('relay')==='1'&&!location.hash.slice(1))alert('中繼房間連結缺少金鑰，請重新掃碼');
- else join(id,false,query.get('relay')==='1'?location.hash.slice(1):'');
-}
+if(id&&query.get('relay')==='1'){
+ const secret=location.hash.slice(1);
+ const joinButton=document.createElement('button');
+ joinButton.textContent='加入小檔中繼房間';
+ if(!/^[a-f0-9]{32}$/.test(id)||!/^[a-f0-9]{64}$/.test(secret)){
+  alert('中繼房間連結不完整，請重新掃碼或開啟完整邀請連結');
+ }else{
+  joinButton.onclick=()=>{
+   joinButton.disabled=true;
+   join(id,false,secret);
+   joinButton.remove();
+  };
+  $('setup').prepend(joinButton);
+ }
+}else if(id)join(id,false);

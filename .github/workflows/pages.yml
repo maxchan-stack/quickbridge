@@ -9,18 +9,31 @@ permissions:
   id-token: write
 concurrency:
   group: pages
-  cancel-in-progress: true
+  cancel-in-progress: false
 jobs:
-  deploy:
+  build-and-deploy:
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Syntax check and unit tests
+        run: |
+          node --check app.js
+          node --check worker/src/index.js
+          node --test tests/*.test.mjs
+      - name: Assemble static site artifact
+        run: |
+          mkdir -p _site/vendor
+          cp index.html style.css app.js config.js _site/
+          cp vendor/qrcode.min.js _site/vendor/
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: .
+          path: _site
       - id: deployment
         uses: actions/deploy-pages@v4

@@ -6,6 +6,7 @@
   const MAX_TEXT_LENGTH = 10000;
   const PING_INTERVAL_MS = 25000;
   const FRAME_OVERHEAD = 29; // 12B IV + 1B type + 16B GCM tag
+  const ECDH_PUB_TAG = 0x02; // Plain binary handshake tag for short-code rooms (66 bytes total)
 
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
@@ -18,9 +19,11 @@
   const state = {
     ws: null,
     pingTimer: null,
-    roomId: '',
+    roomKey: '',
+    shortCodeMode: false,
     role: '',
     bootstrapKey: null,
+    secretBytes: null,
     sessionKey: null,
     ecdhKeyPair: null,
     myPubHex: '',
@@ -35,14 +38,35 @@
     writeQueue: Promise.resolve(),
     readQueue: Promise.resolve(),
     incomingFile: null,
-    pendingOffer: null,
     sendingFile: null,
+    selectedFiles: [],
     blobUrls: []
   };
 
   function randomHex(bytes = 16) {
     const buf = crypto.getRandomValues(new Uint8Array(bytes));
     return bytesToHex(buf);
+  }
+
+  function randomShortCode() {
+    const limit = 1000000;
+    const maxUnbiased = Math.floor(0x100000000 / limit) * limit;
+    const buf = new Uint32Array(1);
+    while (true) {
+      crypto.getRandomValues(buf);
+      if (buf[0] < maxUnbiased) {
+        return String(buf[0] % limit).padStart(6, '0');
+      }
+    }
+  }
+
+  function normalizeShortCode(raw) {
+    const digits = String(raw || '').replace(/\D/g, '');
+    return /^\d{6}$/.test(digits) ? digits : '';
+  }
+
+  function formatShortCode(code) {
+    return `${code.slice(0, 3)}-${code.slice(3, 6)}`;
   }
 
   function bytesToHex(bytes) {
@@ -82,6 +106,11 @@
     if (el) el.textContent = text;
   }
 
+  function setProgressText(text) {
+    const el = $('progressText');
+    if (el) el.textContent = text;
+  }
+
   function updateQuotaDisplay() {
     const el = $('quotaText');
     if (!el) return;
@@ -90,6 +119,22 @@
     const totalMb = Math.round(maxRoomBytes / (1024 * 1024));
     const maxFileMb = Math.round(maxFileBytes / (1024 * 1024));
     el.textContent = `本房間剩餘送出額度：${remMb} MB／${totalMb} MB（單檔上限 ${maxFileMb} MB）`;
+  }
+
+  function updateSelectedFilesUI(files) {
+    state.selectedFiles = Array.from(files || []);
+    const metaEl = $('fileMeta');
+    if (!metaEl) return;
+    if (state.selectedFiles.length === 0) {
+      metaEl.textContent = `點擊選取一或多個檔案，或將檔案拖放到這裡（單檔上限 ${Math.round(maxFileBytes / (1024 * 1024))} MB）`;
+      return;
+    }
+    const totalSize = state.selectedFiles.reduce((sum, f) => sum + f.size, 0);
+    if (state.selectedFiles.length === 1) {
+      metaEl.textContent = `已選取：${sanitizeFilename(state.selectedFiles[0].name)}（${formatBytes(totalSize)}）`;
+    } else {
+      metaEl.textContent = `已選取 ${state.selectedFiles.length} 個檔案（共 ${formatBytes(totalSize)}）`;
+    }
   }
 
   function clearReceived() {
@@ -125,9 +170,11 @@
     cancelPendingSend('連線已重設');
     clearReceived();
 
-    state.roomId = '';
+    state.roomKey = '';
+    state.shortCodeMode = false;
     state.role = '';
     state.bootstrapKey = null;
+    state.secretBytes = null;
     state.sessionKey = null;
     state.ecdhKeyPair = null;
     state.myPubHex = '';
@@ -142,7 +189,7 @@
     state.writeQueue = Promise.resolve();
     state.readQueue = Promise.resolve();
     state.incomingFile = null;
-    state.pendingOffer = null;
+    state.selectedFiles = [];
 
     if ($('app')) $('app').classList.remove('connected');
     if ($('setup')) {
@@ -153,16 +200,19 @@
     if ($('room')) $('room').hidden = true;
     if ($('transfer')) $('transfer').hidden = true;
     if ($('verifyBox')) $('verifyBox').hidden = true;
+    if ($('shortCodeBox')) $('shortCodeBox').hidden = true;
     if ($('confirm')) $('confirm').hidden = false;
     if ($('reject')) $('reject').hidden = false;
     if ($('modeBadge')) $('modeBadge').hidden = true;
     if ($('qr')) $('qr').replaceChildren();
     if ($('copyResult')) $('copyResult').textContent = '';
+    if ($('codeError')) $('codeError').textContent = '';
     if ($('file')) $('file').value = '';
-    if ($('fileMeta')) $('fileMeta').textContent = `點擊選取檔案，或將檔案拖放到這裡（單檔上限 ${Math.round(maxFileBytes / (1024 * 1024))} MB）`;
     if ($('text')) $('text').value = '';
     if ($('progress')) $('progress').value = 0;
     if ($('sendFile')) $('sendFile').disabled = false;
+    setProgressText('');
+    updateSelectedFilesUI([]);
 
     if (clearHistory && typeof history !== 'undefined' && typeof location !== 'undefined') {
       history.replaceState({}, '', location.pathname);
@@ -170,20 +220,21 @@
   }
 
   function aad(senderRole, seq, phase) {
-    return encoder.encode(`${state.roomId}|${phase}|${senderRole}|${seq}`);
+    return encoder.encode(`${state.roomKey}|${phase}|${senderRole}|${seq}`);
   }
 
-  async function deriveSessionKey(sharedBits, secretBytes, roomId) {
-    const combined = new Uint8Array(sharedBits.byteLength + secretBytes.byteLength);
+  async function deriveSessionKey(sharedBits, secretBytes, roomKey) {
+    const extra = secretBytes || new Uint8Array(0);
+    const combined = new Uint8Array(sharedBits.byteLength + extra.byteLength);
     combined.set(new Uint8Array(sharedBits), 0);
-    combined.set(secretBytes, sharedBits.byteLength);
+    if (extra.byteLength) combined.set(extra, sharedBits.byteLength);
 
     const ikm = await crypto.subtle.importKey('raw', combined, 'HKDF', false, ['deriveKey']);
     return crypto.subtle.deriveKey(
       {
         name: 'HKDF',
         hash: 'SHA-256',
-        salt: encoder.encode('QuickBridge-v2-salt|' + roomId),
+        salt: encoder.encode('QuickBridge-v2-salt|' + roomKey),
         info: encoder.encode('QuickBridge-v2-session-key')
       },
       ikm,
@@ -193,12 +244,12 @@
     );
   }
 
-  async function computeSas(roomId, pubHexA, pubHexB) {
+  async function computeSas(roomKey, pubHexA, pubHexB) {
     if (!pubHexA || !pubHexB) throw new Error('缺少雙方臨時公鑰，無法計算驗證碼');
     const sorted = [pubHexA, pubHexB].sort().join('|');
     const digest = await crypto.subtle.digest(
       'SHA-256',
-      encoder.encode(`QuickBridge-SAS-v2|${roomId}|${sorted}`)
+      encoder.encode(`QuickBridge-SAS-v2|${roomKey}|${sorted}`)
     );
     const hex = bytesToHex(new Uint8Array(digest, 0, 4)).toUpperCase();
     return `${hex.slice(0, 4)}-${hex.slice(4, 8)}`;
@@ -211,6 +262,21 @@
     if (state.ws !== socket || socket.readyState !== WebSocket.OPEN) {
       throw new Error('中繼連線已中斷');
     }
+  }
+
+  function enqueueRawFrame(bytes) {
+    const task = state.writeQueue.then(async () => {
+      const socket = state.ws;
+      if (!state.active || !socket || socket.readyState !== WebSocket.OPEN) {
+        throw new Error('中繼連線已關閉');
+      }
+      await drainSocket(socket, 512 * 1024);
+      socket.send(bytes);
+      state.sentBytes += bytes.byteLength;
+      updateQuotaDisplay();
+    });
+    state.writeQueue = task.catch(() => {});
+    return task;
   }
 
   function enqueueSend(payload, isBinary = false, useBootstrap = false) {
@@ -345,7 +411,7 @@
         titleEl: title,
         actionsEl: actions
       };
-      title.textContent = `正在接收：${offer.name}（0%／${formatBytes(offer.size)}）`;
+      title.textContent = `正在接收：${offer.name}（0%｜0 B／${formatBytes(offer.size)}）`;
       actions.replaceChildren();
       try {
         await enqueueSend({ type: 'file-accept', id: offer.id });
@@ -484,52 +550,123 @@
     }
   }
 
-  async function join(id, isHost, secret) {
-    if (!/^[a-f0-9]{32}$/.test(id)) return alert('房間連結無效');
-    if (!/^[a-f0-9]{64}$/.test(secret)) return alert('房間加密金鑰無效');
+  async function checkShortCodeStatus(origin, code) {
+    const statusUrl = new URL(`/relay/code/${code}/status`, origin);
+    const resp = await fetch(statusUrl.href, { method: 'GET', cache: 'no-store' });
+    if (resp.status === 404) {
+      throw new Error('找不到此 6 位數配對碼，請確認輸入是否正確或已超過 5 分鐘有效期限。');
+    }
+    if (resp.status === 409) {
+      throw new Error('此配對碼房間已滿（兩台裝置已連線），請重新建立新房間。');
+    }
+    if (!resp.ok) {
+      throw new Error(`配對服務回應異常（HTTP ${resp.status}），請稍後再試。`);
+    }
+  }
 
+  async function completeEcdhHandshake(peerPubHex) {
+    if (typeof peerPubHex !== 'string' || !/^[a-f0-9]{130}$/.test(peerPubHex)) {
+      throw new Error('無效的對端公鑰');
+    }
+    state.peerPubHex = peerPubHex;
+    const peerPubKey = await crypto.subtle.importKey(
+      'raw',
+      hexToBytes(peerPubHex),
+      { name: 'ECDH', namedCurve: 'P-256' },
+      false,
+      []
+    );
+    const sharedBits = await crypto.subtle.deriveBits(
+      { name: 'ECDH', public: peerPubKey },
+      state.ecdhKeyPair.privateKey,
+      256
+    );
+    state.sessionKey = await deriveSessionKey(sharedBits, state.secretBytes, state.roomKey);
+    const sasCode = await computeSas(state.roomKey, state.myPubHex, state.peerPubHex);
+    $('sas').textContent = `請確認兩端驗證碼相同：${sasCode}`;
+    $('verifyBox').hidden = false;
+    $('confirm').hidden = false;
+    $('reject').hidden = false;
+    setStatus('加密通道已建立，請核對兩端 8 碼驗證碼');
+  }
+
+  async function connectRoom({ mode, id, isHost, secret = '', attempt = 1 }) {
     const origin = window.QUICKBRIDGE_SIGNAL_ORIGIN;
     if (!origin || origin.includes('REPLACE-ME')) {
       return alert('配對服務尚未部署，請先設定 config.js');
     }
 
-    reset({ clearHistory: true });
-    state.roomId = id;
+    const isShortCode = mode === 'code';
+    if (isShortCode && !/^\d{6}$/.test(id)) return alert('6 位數配對碼格式無效');
+    if (!isShortCode && (!/^[a-f0-9]{32}$/.test(id) || !/^[a-f0-9]{64}$/.test(secret))) {
+      return alert('房間連結或加密金鑰無效');
+    }
 
-    const secretBytes = hexToBytes(secret);
-    state.bootstrapKey = await crypto.subtle.importKey('raw', secretBytes, 'AES-GCM', false, ['encrypt', 'decrypt']);
+    if (isShortCode && !isHost) {
+      await checkShortCodeStatus(origin, id);
+    }
+
+    reset({ clearHistory: true });
+    state.shortCodeMode = isShortCode;
+    state.roomKey = isShortCode ? `code:${id}` : id;
+
+    if (!isShortCode) {
+      state.secretBytes = hexToBytes(secret);
+      state.bootstrapKey = await crypto.subtle.importKey('raw', state.secretBytes, 'AES-GCM', false, ['encrypt', 'decrypt']);
+    }
 
     $('setup').hidden = true;
     $('room').hidden = false;
     setStatus('正在連線至加密中繼服務…');
 
     const inviteUrl = new URL(location.pathname, location.origin);
-    inviteUrl.searchParams.set('room', id);
-    inviteUrl.hash = secret;
+    if (isShortCode) {
+      inviteUrl.searchParams.set('code', id);
+    } else {
+      inviteUrl.searchParams.set('room', id);
+      inviteUrl.hash = secret;
+    }
     $('invite').href = inviteUrl.href;
     $('invite').textContent = inviteUrl.href;
 
     if (isHost) {
+      if (isShortCode) {
+        $('shortCodeText').textContent = formatShortCode(id);
+        $('shortCodeBox').hidden = false;
+      }
       if (typeof window.QRCode === 'function') {
         new window.QRCode($('qr'), { text: inviteUrl.href, width: 200, height: 200 });
       } else {
-        $('copyResult').textContent = 'QR Code 模組未載入，請點擊「複製邀請連結」分享。';
+        $('copyResult').textContent = 'QR Code 模組未載入，請使用 6 位數配對碼或複製連結。';
       }
     }
 
     const wsUrl = new URL(origin);
     wsUrl.protocol = wsUrl.protocol === 'https:' ? 'wss:' : 'ws:';
-    wsUrl.pathname = `/relay/${id}`;
+    if (isShortCode) {
+      wsUrl.pathname = `/relay/code/${id}`;
+      if (isHost) wsUrl.searchParams.set('create', '1');
+    } else {
+      wsUrl.pathname = `/relay/${id}`;
+    }
 
     const socket = new WebSocket(wsUrl.href);
     socket.binaryType = 'arraybuffer';
     state.ws = socket;
 
+    let opened = false;
     let socketError = false;
 
     socket.onopen = () => {
       if (state.ws !== socket) return;
-      setStatus(isHost ? '等待另一台裝置掃碼加入…' : '已連線，正在與發起端握手…');
+      opened = true;
+      setStatus(
+        isHost
+          ? isShortCode
+            ? `等待另一台裝置掃碼或輸入配對碼 ${formatShortCode(id)}…`
+            : '等待另一台裝置掃碼加入…'
+          : '已連線，正在與發起端握手…'
+      );
       state.pingTimer = setInterval(() => {
         if (state.ws === socket && socket.readyState === WebSocket.OPEN) {
           try {
@@ -549,6 +686,13 @@
         clearInterval(state.pingTimer);
         state.pingTimer = null;
       }
+
+      // If creating a short-code room collided (409 -> immediate close before open), retry with a new code
+      if (!opened && isShortCode && isHost && attempt < 4) {
+        connectRoom({ mode: 'code', id: randomShortCode(), isHost: true, attempt: attempt + 1 });
+        return;
+      }
+
       state.active = false;
       state.verified = false;
       state.incomingFile = null;
@@ -559,6 +703,8 @@
 
       if (event.reason === 'Peer left') {
         setStatus('對方已離開房間，請點擊「結束房間」後重新建立。');
+      } else if (event.reason === 'Code expired') {
+        setStatus('6 位數配對碼已超過 5 分鐘未配對而自動失效，請重新建立房間。');
       } else if (event.reason === 'Room expired') {
         setStatus('房間閒置逾時（15 分鐘）已自動關閉，請重新建立。');
       } else if (event.reason === 'Room quota exceeded') {
@@ -593,7 +739,12 @@
               cancelPendingSend('對方已離線');
               $('transfer').hidden = true;
               $('verifyBox').hidden = true;
-              setStatus(msg.reason === 'Room expired' ? '房間閒置逾時已關閉' : '對方已離開房間，請建立新房間');
+              const reasonText = msg.reason === 'Code expired'
+                ? '6 位數配對碼已過期'
+                : msg.reason === 'Room expired'
+                  ? '房間閒置逾時已關閉'
+                  : '對方已離開房間，請建立新房間';
+              setStatus(reasonText);
               return;
             }
             if (msg.type === 'quota-exceeded') {
@@ -610,7 +761,15 @@
               );
               const rawPub = new Uint8Array(await crypto.subtle.exportKey('raw', state.ecdhKeyPair.publicKey));
               state.myPubHex = bytesToHex(rawPub);
-              await enqueueSend({ type: 'ecdh', pub: state.myPubHex }, false, true);
+
+              if (state.shortCodeMode) {
+                const pubFrame = new Uint8Array(1 + rawPub.byteLength);
+                pubFrame[0] = ECDH_PUB_TAG;
+                pubFrame.set(rawPub, 1);
+                await enqueueRawFrame(pubFrame);
+              } else {
+                await enqueueSend({ type: 'ecdh', pub: state.myPubHex }, false, true);
+              }
               return;
             }
             return;
@@ -619,10 +778,20 @@
           if (!state.active) return;
 
           const packet = new Uint8Array(event.data);
+          const isHandshake = !state.sessionKey;
+
+          if (isHandshake && state.shortCodeMode) {
+            if (packet.byteLength !== 66 || packet[0] !== ECDH_PUB_TAG) {
+              throw new Error('短碼握手封包格式錯誤');
+            }
+            const peerPubHex = bytesToHex(packet.subarray(1));
+            await completeEcdhHandshake(peerPubHex);
+            return;
+          }
+
           if (packet.byteLength < FRAME_OVERHEAD) throw new Error('封包長度異常');
 
           const otherRole = state.role === 'host' ? 'guest' : 'host';
-          const isHandshake = !state.sessionKey;
           const key = isHandshake ? state.bootstrapKey : state.sessionKey;
           const phase = isHandshake ? 'hs' : 'app';
 
@@ -643,29 +812,8 @@
           if (isHandshake) {
             if (plain[0] !== 1) throw new Error('握手封包格式錯誤');
             const hsMsg = JSON.parse(decoder.decode(plain.subarray(1)));
-            if (hsMsg.type !== 'ecdh' || typeof hsMsg.pub !== 'string' || !/^[a-f0-9]{130}$/.test(hsMsg.pub)) {
-              throw new Error('無效的對端公鑰');
-            }
-            state.peerPubHex = hsMsg.pub;
-            const peerPubKey = await crypto.subtle.importKey(
-              'raw',
-              hexToBytes(hsMsg.pub),
-              { name: 'ECDH', namedCurve: 'P-256' },
-              false,
-              []
-            );
-            const sharedBits = await crypto.subtle.deriveBits(
-              { name: 'ECDH', public: peerPubKey },
-              state.ecdhKeyPair.privateKey,
-              256
-            );
-            state.sessionKey = await deriveSessionKey(sharedBits, secretBytes, state.roomId);
-            const sasCode = await computeSas(state.roomId, state.myPubHex, state.peerPubHex);
-            $('sas').textContent = `請確認兩端驗證碼相同：${sasCode}`;
-            $('verifyBox').hidden = false;
-            $('confirm').hidden = false;
-            $('reject').hidden = false;
-            setStatus('加密通道已建立，請核對兩端驗證碼');
+            if (hsMsg.type !== 'ecdh') throw new Error('無效的握手訊息');
+            await completeEcdhHandshake(hsMsg.pub);
             return;
           }
 
@@ -689,7 +837,7 @@
             const pct = state.incomingFile.size > 0
               ? Math.min(100, Math.round((state.incomingFile.bytes / state.incomingFile.size) * 100))
               : 100;
-            state.incomingFile.titleEl.textContent = `正在接收：${state.incomingFile.name}（${pct}%／${formatBytes(state.incomingFile.size)}）`;
+            state.incomingFile.titleEl.textContent = `正在接收：${state.incomingFile.name}（${pct}%｜${formatBytes(state.incomingFile.bytes)}／${formatBytes(state.incomingFile.size)}）`;
 
             if (state.incomingFile.chunksSinceAck >= WINDOW_CHUNKS) {
               state.incomingFile.chunksSinceAck = 0;
@@ -715,80 +863,66 @@
     };
   }
 
-  async function sendSelectedFile() {
-    const fileInput = $('file');
-    const file = fileInput.files?.[0];
-    if (!file || !state.verified || state.sendingFile) return;
-
-    if (file.size > maxFileBytes) {
-      alert(`單檔上限為 ${Math.round(maxFileBytes / (1024 * 1024))} MB，請選擇較小的檔案。`);
-      return;
-    }
-
-    const estimatedBytes = file.size + Math.ceil(Math.max(1, file.size) / CHUNK_SIZE) * FRAME_OVERHEAD + 1024;
-    if (state.sentBytes + estimatedBytes > maxRoomBytes) {
-      alert('本房間剩餘傳輸額度不足以傳送此檔案，請結束並建立新房間。');
-      return;
-    }
-
+  async function sendOneFile(file, index, total) {
     const socket = state.ws;
-    const sendBtn = $('sendFile');
     const progressEl = $('progress');
-    sendBtn.disabled = true;
     progressEl.value = 0;
 
     const fileId = randomHex(8);
     const safeName = sanitizeFilename(file.name);
+    const prefix = total > 1 ? `[${index + 1}/${total}] ` : '';
+
+    setStatus(`${prefix}正在計算檔案指紋（SHA-256）：${safeName}…`);
+    setProgressText(`${prefix}準備傳送：${safeName}（${formatBytes(file.size)}）`);
+
+    const digest = await crypto.subtle.digest('SHA-256', await file.arrayBuffer());
+    const sha256 = bytesToHex(new Uint8Array(digest));
+
+    let acceptResolve;
+    let acceptReject;
+    const acceptPromise = new Promise((resolve, reject) => {
+      acceptResolve = resolve;
+      acceptReject = reject;
+    });
+
+    let ackResolve;
+    let ackReject;
+    const fileAckPromise = new Promise((resolve, reject) => {
+      ackResolve = resolve;
+      ackReject = reject;
+    });
+
+    let remoteAckedBytes = 0;
+    let windowWaiter = null;
+
+    state.sendingFile = {
+      id: fileId,
+      onAccept: () => acceptResolve(),
+      onReject: () => acceptReject(Object.assign(new Error('對方拒絕接收此檔案'), { skipped: true })),
+      onChunkAck: receivedBytes => {
+        remoteAckedBytes = receivedBytes;
+        if (windowWaiter) {
+          const wake = windowWaiter;
+          windowWaiter = null;
+          wake();
+        }
+      },
+      onFileAck: (ok, reason) => {
+        if (ok) ackResolve();
+        else ackReject(new Error(`對方驗證失敗（${reason || 'unknown'}）`));
+      },
+      reject: err => {
+        acceptReject(err);
+        ackReject(err);
+        if (windowWaiter) {
+          const wake = windowWaiter;
+          windowWaiter = null;
+          wake();
+        }
+      }
+    };
 
     try {
-      setStatus(`正在計算檔案指紋（SHA-256）：${safeName}…`);
-      const digest = await crypto.subtle.digest('SHA-256', await file.arrayBuffer());
-      const sha256 = bytesToHex(new Uint8Array(digest));
-
-      let acceptResolve;
-      let acceptReject;
-      const acceptPromise = new Promise((resolve, reject) => {
-        acceptResolve = resolve;
-        acceptReject = reject;
-      });
-
-      let ackResolve;
-      let ackReject;
-      const fileAckPromise = new Promise((resolve, reject) => {
-        ackResolve = resolve;
-        ackReject = reject;
-      });
-
-      let remoteAckedBytes = 0;
-      let windowWaiter = null;
-
-      state.sendingFile = {
-        id: fileId,
-        onAccept: () => acceptResolve(),
-        onReject: () => acceptReject(new Error('對方拒絕接收此檔案')),
-        onChunkAck: receivedBytes => {
-          remoteAckedBytes = receivedBytes;
-          if (windowWaiter) {
-            const wake = windowWaiter;
-            windowWaiter = null;
-            wake();
-          }
-        },
-        onFileAck: (ok, reason) => {
-          if (ok) ackResolve();
-          else ackReject(new Error(`對方驗證失敗（${reason || 'unknown'}）`));
-        },
-        reject: err => {
-          acceptReject(err);
-          ackReject(err);
-          if (windowWaiter) {
-            const wake = windowWaiter;
-            windowWaiter = null;
-            wake();
-          }
-        }
-      };
-
       await enqueueSend({
         type: 'file-offer',
         id: fileId,
@@ -798,10 +932,10 @@
         sha256
       });
 
-      setStatus(`已送出檔案請求，等待對方點擊接受：${safeName}`);
+      setStatus(`${prefix}已送出檔案請求，等待對方點擊接受：${safeName}`);
       await acceptPromise;
 
-      setStatus(`正在加密傳送：${safeName}…`);
+      setStatus(`${prefix}正在加密傳送：${safeName}…`);
       let offset = 0;
       const maxInFlight = WINDOW_CHUNKS * CHUNK_SIZE;
 
@@ -814,7 +948,9 @@
         const slice = await file.slice(offset, offset + CHUNK_SIZE).arrayBuffer();
         await enqueueSend(slice, true);
         offset += slice.byteLength;
-        progressEl.value = Math.min(99, Math.round((offset / file.size) * 100));
+        const pct = Math.min(99, Math.round((offset / file.size) * 100));
+        progressEl.value = pct;
+        setProgressText(`${prefix}傳送中：${safeName}（${formatBytes(offset)}／${formatBytes(file.size)}，${pct}%）`);
       }
 
       await state.writeQueue;
@@ -823,17 +959,67 @@
       await state.writeQueue;
       await drainSocket(socket, 0);
 
-      setStatus(`資料已送出，等待對方完成 SHA-256 完整性驗證：${safeName}…`);
+      setStatus(`${prefix}資料已送出，等待對方完成 SHA-256 完整性驗證：${safeName}…`);
       await fileAckPromise;
 
       progressEl.value = 100;
-      setStatus(`檔案已由對方完整接收並通過 SHA-256 驗證：${safeName}`);
-      fileInput.value = '';
-      $('fileMeta').textContent = `點擊選取檔案，或將檔案拖放到這裡（單檔上限 ${Math.round(maxFileBytes / (1024 * 1024))} MB）`;
+      setProgressText(`${prefix}已完成並通過 SHA-256 驗證：${safeName}（${formatBytes(file.size)}）`);
+      return 'sent';
+    } catch (err) {
+      if (err.skipped) {
+        setProgressText(`${prefix}對方已拒絕：${safeName}`);
+        return 'skipped';
+      }
+      throw err;
+    } finally {
+      state.sendingFile = null;
+    }
+  }
+
+  async function sendSelectedFiles() {
+    if (!state.verified || state.sendingFile) return;
+    const files = state.selectedFiles.length > 0 ? [...state.selectedFiles] : Array.from($('file').files || []);
+    if (files.length === 0) return;
+
+    const maxFileMb = Math.round(maxFileBytes / (1024 * 1024));
+    for (const file of files) {
+      if (file.size > maxFileBytes) {
+        alert(`「${sanitizeFilename(file.name)}」超過單檔上限 ${maxFileMb} MB，請移除後再傳送。`);
+        return;
+      }
+    }
+
+    const totalEstimated = files.reduce(
+      (sum, f) => sum + f.size + Math.ceil(Math.max(1, f.size) / CHUNK_SIZE) * FRAME_OVERHEAD + 1024,
+      0
+    );
+    if (state.sentBytes + totalEstimated > maxRoomBytes) {
+      alert('本房間剩餘傳輸額度不足以傳送全部檔案，請減少檔案或建立新房間。');
+      return;
+    }
+
+    const sendBtn = $('sendFile');
+    sendBtn.disabled = true;
+
+    let sentCount = 0;
+    let skippedCount = 0;
+    try {
+      for (let i = 0; i < files.length; i++) {
+        const result = await sendOneFile(files[i], i, files.length);
+        if (result === 'sent') sentCount++;
+        else if (result === 'skipped') skippedCount++;
+      }
+
+      if (files.length === 1 && sentCount === 1) {
+        setStatus(`檔案已由對方完整接收並通過 SHA-256 驗證：${sanitizeFilename(files[0].name)}`);
+      } else {
+        setStatus(`佇列完成：成功傳送 ${sentCount} 個檔案${skippedCount ? `，對方拒絕 ${skippedCount} 個` : ''}`);
+      }
+      $('file').value = '';
+      updateSelectedFilesUI([]);
     } catch (err) {
       setStatus(`傳送失敗：${err.message}`);
     } finally {
-      state.sendingFile = null;
       sendBtn.disabled = false;
     }
   }
@@ -842,7 +1028,36 @@
     if (typeof document === 'undefined') return;
 
     $('leave').onclick = () => reset({ clearHistory: true });
-    $('createRelay').onclick = () => join(randomHex(16), true, randomHex(32));
+    $('createRelay').onclick = () => connectRoom({ mode: 'code', id: randomShortCode(), isHost: true });
+
+    const codeForm = $('codeForm');
+    const codeInput = $('codeInput');
+    const codeError = $('codeError');
+    const joinByCodeBtn = $('joinByCode');
+
+    codeInput.addEventListener('input', () => {
+      const digits = codeInput.value.replace(/\D/g, '').slice(0, 6);
+      codeInput.value = digits.length > 3 ? `${digits.slice(0, 3)}-${digits.slice(3)}` : digits;
+      codeError.textContent = '';
+    });
+
+    codeForm.addEventListener('submit', async e => {
+      e.preventDefault();
+      const code = normalizeShortCode(codeInput.value);
+      if (!code) {
+        codeError.textContent = '請輸入完整的 6 位數配對碼。';
+        return;
+      }
+      joinByCodeBtn.disabled = true;
+      codeError.textContent = '';
+      try {
+        await connectRoom({ mode: 'code', id: code, isHost: false });
+      } catch (err) {
+        codeError.textContent = err.message;
+      } finally {
+        joinByCodeBtn.disabled = false;
+      }
+    });
 
     $('copyInvite').onclick = async () => {
       const invite = $('invite');
@@ -893,19 +1108,13 @@
       }
     };
 
-    $('sendFile').onclick = () => sendSelectedFile();
+    $('sendFile').onclick = () => sendSelectedFiles();
     $('clearReceived').onclick = () => clearReceived();
 
     const fileInput = $('file');
-    const fileMeta = $('fileMeta');
     const dropzone = $('dropzone');
 
-    const showSelectedFile = file => {
-      if (!file) return;
-      fileMeta.textContent = `已選取：${sanitizeFilename(file.name)}（${formatBytes(file.size)}）`;
-    };
-
-    fileInput.addEventListener('change', () => showSelectedFile(fileInput.files?.[0]));
+    fileInput.addEventListener('change', () => updateSelectedFilesUI(fileInput.files));
 
     dropzone.addEventListener('dragover', e => {
       e.preventDefault();
@@ -915,20 +1124,41 @@
     dropzone.addEventListener('drop', e => {
       e.preventDefault();
       dropzone.classList.remove('dragover');
-      const file = e.dataTransfer?.files?.[0];
-      if (!file) return;
-      const dt = new DataTransfer();
-      dt.items.add(file);
-      fileInput.files = dt.files;
-      showSelectedFile(file);
+      const dropped = Array.from(e.dataTransfer?.files || []);
+      if (dropped.length === 0) return;
+      updateSelectedFilesUI(dropped);
     });
 
     const query = new URLSearchParams(location.search);
-    const id = query.get('room');
-    const secret = location.hash.slice(1);
-    if (id) {
+    const shortCodeParam = query.get('code');
+    const roomParam = query.get('room');
+    const secretParam = location.hash.slice(1);
+
+    if (shortCodeParam) {
       history.replaceState({}, '', location.pathname);
-      if (!/^[a-f0-9]{32}$/.test(id) || !/^[a-f0-9]{64}$/.test(secret)) {
+      const code = normalizeShortCode(shortCodeParam);
+      if (!code) {
+        alert('邀請連結中的 6 位數配對碼無效。');
+      } else {
+        $('setup').classList.add('joining');
+        $('joinPromptTitle').textContent = `加入加密房間 ${formatShortCode(code)}`;
+        $('joinPrompt').hidden = false;
+        const joinBtn = $('joinRoomBtn');
+        joinBtn.onclick = async () => {
+          joinBtn.disabled = true;
+          try {
+            await connectRoom({ mode: 'code', id: code, isHost: false });
+          } catch (err) {
+            alert(err.message);
+            reset({ clearHistory: true });
+          } finally {
+            joinBtn.disabled = false;
+          }
+        };
+      }
+    } else if (roomParam) {
+      history.replaceState({}, '', location.pathname);
+      if (!/^[a-f0-9]{32}$/.test(roomParam) || !/^[a-f0-9]{64}$/.test(secretParam)) {
         alert('房間連結不完整或已失效，請重新掃碼或開啟完整邀請連結。');
       } else {
         $('setup').classList.add('joining');
@@ -936,7 +1166,7 @@
         const joinBtn = $('joinRoomBtn');
         joinBtn.onclick = () => {
           joinBtn.disabled = true;
-          join(id, false, secret);
+          connectRoom({ mode: 'room', id: roomParam, isHost: false, secret: secretParam });
         };
       }
     }
@@ -949,7 +1179,10 @@
       bytesToHex,
       hexToBytes,
       computeSas,
-      deriveSessionKey
+      deriveSessionKey,
+      randomShortCode,
+      normalizeShortCode,
+      formatShortCode
     };
   }
 

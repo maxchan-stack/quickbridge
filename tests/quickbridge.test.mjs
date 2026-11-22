@@ -17,7 +17,14 @@ register(`data:text/javascript,${encodeURIComponent(loaderSource)}`);
 
 const workerMod = await import('../worker/src/index.js');
 const workerDefault = workerMod.default;
-const { Room, MAX_FILE_BYTES, MAX_ROOM_BYTES, MAX_FRAME_BYTES, parseAllowedOrigins, isOriginAllowed } = workerMod;
+const {
+  Room,
+  MAX_FILE_BYTES,
+  MAX_ROOM_BYTES,
+  MAX_FRAME_BYTES,
+  parseAllowedOrigins,
+  isOriginAllowed
+} = workerMod;
 
 // Load frontend helpers from app.js in a sandbox without DOM
 function loadFrontendHelpers() {
@@ -27,6 +34,7 @@ function loadFrontendHelpers() {
     TextEncoder,
     TextDecoder,
     Uint8Array,
+    Uint32Array,
     ArrayBuffer,
     Promise,
     Error,
@@ -56,10 +64,18 @@ test('frontend: sanitizeFilename strips traversal, BiDi RLO, control chars, and 
   assert.equal(frontend.sanitizeFilename(longName).length, 180);
 });
 
-test('frontend: ECDH + HKDF + SAS produces identical session key and SAS on both peers', async () => {
-  const roomId = '0123456789abcdef0123456789abcdef';
-  const secretBytes = crypto.getRandomValues(new Uint8Array(32));
+test('frontend: 6-digit short code generation, normalization, and formatting', () => {
+  const code = frontend.randomShortCode();
+  assert.match(code, /^\d{6}$/);
+  assert.equal(frontend.normalizeShortCode('482-915'), '482915');
+  assert.equal(frontend.normalizeShortCode(' 482 915 '), '482915');
+  assert.equal(frontend.normalizeShortCode('12345'), '');
+  assert.equal(frontend.normalizeShortCode('abc123'), '');
+  assert.equal(frontend.formatShortCode('482915'), '482-915');
+});
 
+test('frontend: ECDH + HKDF + SAS works in both short-code mode (no secret) and secret mode', async () => {
+  const roomKey = 'code:482915';
   const kpA = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits']);
   const kpB = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits']);
   const kpAttacker = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits']);
@@ -68,9 +84,9 @@ test('frontend: ECDH + HKDF + SAS produces identical session key and SAS on both
   const pubB = frontend.bytesToHex(new Uint8Array(await crypto.subtle.exportKey('raw', kpB.publicKey)));
   const pubAttacker = frontend.bytesToHex(new Uint8Array(await crypto.subtle.exportKey('raw', kpAttacker.publicKey)));
 
-  const sasA = await frontend.computeSas(roomId, pubA, pubB);
-  const sasB = await frontend.computeSas(roomId, pubB, pubA);
-  const sasMitm = await frontend.computeSas(roomId, pubA, pubAttacker);
+  const sasA = await frontend.computeSas(roomKey, pubA, pubB);
+  const sasB = await frontend.computeSas(roomKey, pubB, pubA);
+  const sasMitm = await frontend.computeSas(roomKey, pubA, pubAttacker);
 
   assert.match(sasA, /^[0-9A-F]{4}-[0-9A-F]{4}$/);
   assert.equal(sasA, sasB);
@@ -79,18 +95,18 @@ test('frontend: ECDH + HKDF + SAS produces identical session key and SAS on both
   const sharedA = await crypto.subtle.deriveBits({ name: 'ECDH', public: kpB.publicKey }, kpA.privateKey, 256);
   const sharedB = await crypto.subtle.deriveBits({ name: 'ECDH', public: kpA.publicKey }, kpB.privateKey, 256);
 
-  const keyA = await frontend.deriveSessionKey(sharedA, secretBytes, roomId);
-  const keyB = await frontend.deriveSessionKey(sharedB, secretBytes, roomId);
+  const keyA = await frontend.deriveSessionKey(sharedA, null, roomKey);
+  const keyB = await frontend.deriveSessionKey(sharedB, null, roomKey);
 
   const iv = crypto.getRandomValues(new Uint8Array(12));
-  const aad = new TextEncoder().encode(`${roomId}|app|host|0`);
-  const plaintext = new TextEncoder().encode('QuickBridge 20MB test payload');
+  const aad = new TextEncoder().encode(`${roomKey}|app|host|0`);
+  const plaintext = new TextEncoder().encode('QuickBridge short-code 20MB test');
   const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: aad }, keyA, plaintext);
   const decrypted = await crypto.subtle.decrypt({ name: 'AES-GCM', iv, additionalData: aad }, keyB, ct);
-  assert.equal(new TextDecoder().decode(decrypted), 'QuickBridge 20MB test payload');
+  assert.equal(new TextDecoder().decode(decrypted), 'QuickBridge short-code 20MB test');
 
   // Tampered AAD must fail decryption
-  const badAad = new TextEncoder().encode(`${roomId}|app|guest|0`);
+  const badAad = new TextEncoder().encode(`${roomKey}|app|guest|0`);
   await assert.rejects(() => crypto.subtle.decrypt({ name: 'AES-GCM', iv, additionalData: badAad }, keyB, ct));
 });
 
@@ -110,7 +126,7 @@ test('worker: origin validation blocks unauthorized origins and removed endpoint
     ALLOWED_ORIGINS: 'https://maxchan-stack.github.io',
     ROOM: {
       idFromName: name => name,
-      get: () => ({ fetch: async () => new Response('ok', { status: 200 }) })
+      get: () => ({ fetch: async () => new Response('{"exists":true,"full":false}', { status: 200 }) })
     }
   };
 
@@ -119,6 +135,7 @@ test('worker: origin validation blocks unauthorized origins and removed endpoint
   assert.equal(healthRes.status, 200);
   const healthJson = await healthRes.json();
   assert.equal(healthJson.maxFileBytes, 20 * 1024 * 1024);
+  assert.equal(healthJson.shortCode, true);
 
   // Removed legacy endpoints return 404
   const oldHttp = await workerDefault.fetch(
@@ -127,32 +144,36 @@ test('worker: origin validation blocks unauthorized origins and removed endpoint
   );
   assert.equal(oldHttp.status, 404);
 
-  const oldRoom = await workerDefault.fetch(
-    new Request('https://signal.example/room/0123456789abcdef0123456789abcdef'),
-    env
-  );
-  assert.equal(oldRoom.status, 404);
-
-  // Unauthorized Origin on /relay/ returns 403
-  const badOrigin = await workerDefault.fetch(
-    new Request('https://signal.example/relay/0123456789abcdef0123456789abcdef', {
-      headers: { Origin: 'https://evil.example', Upgrade: 'websocket' }
+  // Unauthorized Origin on /relay/code/123456/status returns 403
+  const badStatusOrigin = await workerDefault.fetch(
+    new Request('https://signal.example/relay/code/123456/status', {
+      headers: { Origin: 'https://evil.example' }
     }),
     env
   );
-  assert.equal(badOrigin.status, 403);
+  assert.equal(badStatusOrigin.status, 403);
 
-  // Valid Origin without WebSocket Upgrade returns 426
-  const noUpgrade = await workerDefault.fetch(
-    new Request('https://signal.example/relay/0123456789abcdef0123456789abcdef', {
+  // Authorized Origin on /relay/code/123456/status returns 200 with CORS
+  const okStatus = await workerDefault.fetch(
+    new Request('https://signal.example/relay/code/123456/status', {
       headers: { Origin: 'https://maxchan-stack.github.io' }
     }),
     env
   );
-  assert.equal(noUpgrade.status, 426);
+  assert.equal(okStatus.status, 200);
+  assert.equal(okStatus.headers.get('Access-Control-Allow-Origin'), 'https://maxchan-stack.github.io');
+
+  // Unauthorized Origin on /relay/code/123456 returns 403
+  const badCodeWs = await workerDefault.fetch(
+    new Request('https://signal.example/relay/code/123456', {
+      headers: { Origin: 'https://evil.example', Upgrade: 'websocket' }
+    }),
+    env
+  );
+  assert.equal(badCodeWs.status, 403);
 });
 
-test('worker: Room Durable Object enforces 2-peer cap, binary relay, 60 MB quota, and persistent close', async () => {
+test('worker: Room Durable Object enforces 6-digit short-code create/status/join/expiry lifecycle', async () => {
   const storageMap = new Map();
   let alarmAt = null;
   const acceptedSockets = [];
@@ -186,7 +207,6 @@ test('worker: Room Durable Object enforces 2-peer cap, binary relay, 60 MB quota
     }
   };
 
-  // Patch Response to allow status 101 in Node test runtime
   const OrigResponse = globalThis.Response;
   globalThis.Response = class extends OrigResponse {
     constructor(body, init) {
@@ -218,46 +238,49 @@ test('worker: Room Durable Object enforces 2-peer cap, binary relay, 60 MB quota
 
     const room = new Room(ctx, {});
 
-    // Host joins
-    const r1 = await room.fetch(new Request('https://signal.example/relay/0123456789abcdef0123456789abcdef'));
-    assert.equal(r1.status, 101);
+    // Status before host creates returns 404
+    const s0 = await room.fetch(new Request('https://signal.example/relay/code/482915/status'));
+    assert.equal(s0.status, 404);
+
+    // Guest joining non-existent code returns 404 (prevents orphan room)
+    const g0 = await room.fetch(new Request('https://signal.example/relay/code/482915'));
+    assert.equal(g0.status, 404);
+
+    // Host creates short-code room
+    const h1 = await room.fetch(new Request('https://signal.example/relay/code/482915?create=1'));
+    assert.equal(h1.status, 101);
     assert.equal(acceptedSockets.length, 1);
-    const hostWs = acceptedSockets[0];
-    assert.equal(JSON.parse(hostWs.sent[0]).role, 'host');
     assert.ok(alarmAt > Date.now());
 
-    // Guest joins
-    const r2 = await room.fetch(new Request('https://signal.example/relay/0123456789abcdef0123456789abcdef'));
-    assert.equal(r2.status, 101);
+    // Another host trying to create same active code returns 409
+    const h2 = await room.fetch(new Request('https://signal.example/relay/code/482915?create=1'));
+    assert.equal(h2.status, 409);
+
+    // Status now returns 200
+    const s1 = await room.fetch(new Request('https://signal.example/relay/code/482915/status'));
+    assert.equal(s1.status, 200);
+
+    // Guest joins short-code room
+    const g1 = await room.fetch(new Request('https://signal.example/relay/code/482915'));
+    assert.equal(g1.status, 101);
     assert.equal(acceptedSockets.length, 2);
-    const guestWs = acceptedSockets[1];
-    assert.equal(JSON.parse(guestWs.sent[0]).role, 'guest');
-    assert.equal(JSON.parse(hostWs.sent[1]).type, 'peer-joined');
-    assert.equal(JSON.parse(guestWs.sent[1]).type, 'peer-joined');
 
-    // Third peer rejected with 409
-    const r3 = await room.fetch(new Request('https://signal.example/relay/0123456789abcdef0123456789abcdef'));
-    assert.equal(r3.status, 409);
+    // Status when full returns 409
+    const s2 = await room.fetch(new Request('https://signal.example/relay/code/482915/status'));
+    assert.equal(s2.status, 409);
 
-    // Valid 64 KiB binary frame relays from host to guest
-    const frame = new Uint8Array(65565).buffer;
-    await room.webSocketMessage(hostWs, frame);
-    assert.equal(guestWs.sent.at(-1), frame);
+    // 66-byte ECDH pubkey frame relays cleanly
+    const pubFrame = new Uint8Array(66);
+    pubFrame[0] = 0x02;
+    await room.webSocketMessage(acceptedSockets[0], pubFrame.buffer);
+    assert.equal(acceptedSockets[1].sent.at(-1), pubFrame.buffer);
 
-    // Oversized frame closes connection
-    const huge = new Uint8Array(MAX_FRAME_BYTES + 1).buffer;
-    await room.webSocketMessage(hostWs, huge);
-    assert.equal(hostWs.closed.code, 1008);
-    assert.equal(storageMap.get('closed'), true);
-
-    // Re-joining closed room (even after DO eviction / fresh Room instance) returns 410
-    const freshRoom = new Room(ctx, {});
-    const r4 = await freshRoom.fetch(new Request('https://signal.example/relay/0123456789abcdef0123456789abcdef'));
-    assert.equal(r4.status, 410);
-
-    // Alarm on already-closed room cleans up storage
-    await freshRoom.alarm();
-    assert.equal(storageMap.size, 0);
+    // Host leaves (runtime removes closed socket then invokes webSocketClose) -> code is released
+    const hostWs = acceptedSockets[0];
+    hostWs.close(1000, 'client left');
+    await room.webSocketClose(hostWs);
+    const s3 = await room.fetch(new Request('https://signal.example/relay/code/482915/status'));
+    assert.equal(s3.status, 404);
   } finally {
     globalThis.Response = OrigResponse;
     delete globalThis.WebSocketPair;

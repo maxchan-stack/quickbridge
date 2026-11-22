@@ -2,9 +2,10 @@ import { DurableObject } from 'cloudflare:workers';
 
 export const MAX_FILE_BYTES = 20 * 1024 * 1024;
 export const MAX_ROOM_BYTES = 60 * 1024 * 1024;
-export const MIN_FRAME_BYTES = 29; // 12B IV + 1B type + 16B GCM tag
+export const MIN_FRAME_BYTES = 29; // 12B IV + 1B type + 16B GCM tag (or 66B ECDH pubkey frame)
 export const MAX_FRAME_BYTES = 70000; // 64 KiB chunk + encryption/header overhead
-const IDLE_TIMEOUT_MS = 15 * 60 * 1000;
+export const UNPAIRED_TIMEOUT_MS = 5 * 60 * 1000;
+export const IDLE_TIMEOUT_MS = 15 * 60 * 1000;
 const CLOSED_RETENTION_MS = 24 * 60 * 60 * 1000;
 const ALARM_REFRESH_INTERVAL_MS = 60 * 1000;
 
@@ -56,6 +57,7 @@ export default {
         {
           ok: true,
           mode: 'ws-hibernation-relay',
+          shortCode: true,
           maxFileBytes: MAX_FILE_BYTES,
           maxRoomBytes: MAX_ROOM_BYTES
         },
@@ -63,6 +65,35 @@ export default {
       );
     }
 
+    // 6-digit short code status preflight: GET /relay/code/123456/status
+    const codeStatusMatch = url.pathname.match(/^\/relay\/code\/(\d{6})\/status$/);
+    if (codeStatusMatch && request.method === 'GET') {
+      if (!isOriginAllowed(origin, allowed)) {
+        return new Response('Forbidden origin', { status: 403 });
+      }
+      const id = env.ROOM.idFromName('code:' + codeStatusMatch[1]);
+      const resp = await env.ROOM.get(id).fetch(request);
+      const data = await resp.text();
+      return new Response(data, {
+        status: resp.status,
+        headers: { ...corsHeaders(origin), 'Content-Type': 'application/json' }
+      });
+    }
+
+    // 6-digit short code WebSocket: GET /relay/code/123456[?create=1]
+    const codeMatch = url.pathname.match(/^\/relay\/code\/(\d{6})$/);
+    if (codeMatch) {
+      if (!isOriginAllowed(origin, allowed)) {
+        return new Response('Forbidden origin', { status: 403 });
+      }
+      if (request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') {
+        return new Response('Expected WebSocket upgrade', { status: 426 });
+      }
+      const id = env.ROOM.idFromName('code:' + codeMatch[1]);
+      return env.ROOM.get(id).fetch(request);
+    }
+
+    // 32-hex legacy/direct room WebSocket: GET /relay/<32hex>
     const match = url.pathname.match(/^\/relay\/([a-f0-9]{32})$/);
     if (!match) {
       return new Response('Not found', { status: 404 });
@@ -90,16 +121,20 @@ export class Room extends DurableObject {
     }
   }
 
-  async refreshAlarm() {
+  async refreshAlarm(timeoutMs = IDLE_TIMEOUT_MS, force = false) {
     const now = Date.now();
-    if (now - this.lastAlarmAt < ALARM_REFRESH_INTERVAL_MS) return;
+    if (!force && now - this.lastAlarmAt < ALARM_REFRESH_INTERVAL_MS) return;
     this.lastAlarmAt = now;
-    await this.ctx.storage.setAlarm(now + IDLE_TIMEOUT_MS);
+    await this.ctx.storage.setAlarm(now + timeoutMs);
   }
 
-  async closeRoom(leavingSocket, reason) {
-    await this.ctx.storage.put('closed', true);
-    await this.ctx.storage.setAlarm(Date.now() + CLOSED_RETENTION_MS);
+  async closeRoom(leavingSocket, reason, isShortCode = false) {
+    if (isShortCode) {
+      await this.ctx.storage.deleteAll();
+    } else {
+      await this.ctx.storage.put('closed', true);
+      await this.ctx.storage.setAlarm(Date.now() + CLOSED_RETENTION_MS);
+    }
 
     for (const ws of this.ctx.getWebSockets()) {
       if (ws === leavingSocket) continue;
@@ -113,13 +148,48 @@ export class Room extends DurableObject {
   }
 
   async fetch(request) {
-    if (await this.ctx.storage.get('closed')) {
-      return new Response('Room closed', { status: 410 });
+    const url = new URL(request.url);
+    const isCodeStatus = /^\/relay\/code\/\d{6}\/status$/.test(url.pathname);
+    const isShortCode = /^\/relay\/code\/\d{6}$/.test(url.pathname);
+
+    if (isCodeStatus) {
+      const sockets = this.ctx.getWebSockets();
+      if (sockets.length === 0) {
+        return Response.json({ exists: false, full: false }, { status: 404 });
+      }
+      if (sockets.length >= 2) {
+        return Response.json({ exists: true, full: true }, { status: 409 });
+      }
+      const existing = sockets[0].deserializeAttachment?.() || {};
+      if (existing.role !== 'host') {
+        return Response.json({ exists: false, full: false }, { status: 404 });
+      }
+      return Response.json({ exists: true, full: false }, { status: 200 });
     }
 
     const sockets = this.ctx.getWebSockets();
-    if (sockets.length >= 2) {
-      return new Response('Room full', { status: 409 });
+
+    if (isShortCode) {
+      const isCreate = url.searchParams.get('create') === '1';
+      if (isCreate) {
+        if (sockets.length > 0) {
+          return new Response('Code in use', { status: 409 });
+        }
+      } else {
+        if (sockets.length === 0) {
+          return new Response('Room not found', { status: 404 });
+        }
+        if (sockets.length >= 2) {
+          return new Response('Room full', { status: 409 });
+        }
+      }
+    } else {
+      if (await this.ctx.storage.get('closed')) {
+        return new Response('Room closed', { status: 410 });
+      }
+      if (sockets.length >= 2) {
+        return new Response('Room full', { status: 409 });
+      }
     }
 
     let role = 'host';
@@ -136,8 +206,8 @@ export class Room extends DurableObject {
     const server = pair[1];
 
     this.ctx.acceptWebSocket(server, [role]);
-    server.serializeAttachment({ role, bytes: 0 });
-    await this.refreshAlarm();
+    server.serializeAttachment({ role, bytes: 0, shortCode: isShortCode });
+    await this.refreshAlarm(role === 'host' && isShortCode ? UNPAIRED_TIMEOUT_MS : IDLE_TIMEOUT_MS, true);
 
     server.send(
       JSON.stringify({
@@ -163,7 +233,9 @@ export class Room extends DurableObject {
   }
 
   async webSocketMessage(ws, message) {
-    if (await this.ctx.storage.get('closed')) {
+    const meta = ws.deserializeAttachment?.() || { role: 'unknown', bytes: 0, shortCode: false };
+
+    if (!meta.shortCode && (await this.ctx.storage.get('closed'))) {
       ws.close(1000, 'Room closed');
       return;
     }
@@ -187,7 +259,7 @@ export class Room extends DurableObject {
 
     if (byteLength < MIN_FRAME_BYTES || byteLength > MAX_FRAME_BYTES) {
       ws.close(1008, 'Invalid frame size');
-      await this.closeRoom(ws, 'Invalid frame size');
+      await this.closeRoom(ws, 'Invalid frame size', meta.shortCode);
       return;
     }
 
@@ -196,59 +268,68 @@ export class Room extends DurableObject {
       return;
     }
 
-    const meta = ws.deserializeAttachment?.() || { role: 'unknown', bytes: 0 };
     if (meta.bytes + byteLength > MAX_ROOM_BYTES) {
       try {
         ws.send(JSON.stringify({ type: 'quota-exceeded', maxRoomBytes: MAX_ROOM_BYTES }));
       } catch {}
       ws.close(1008, 'Room quota exceeded');
-      await this.closeRoom(ws, 'Room quota exceeded');
+      await this.closeRoom(ws, 'Room quota exceeded', meta.shortCode);
       return;
     }
 
     meta.bytes += byteLength;
     ws.serializeAttachment(meta);
-    await this.refreshAlarm();
+    await this.refreshAlarm(IDLE_TIMEOUT_MS);
 
     for (const other of sockets) {
       if (other !== ws) {
         try {
           other.send(message);
         } catch {
-          await this.closeRoom(other, 'Peer send failed');
+          await this.closeRoom(other, 'Peer send failed', meta.shortCode);
         }
       }
     }
   }
 
   async webSocketClose(ws) {
-    if (!(await this.ctx.storage.get('closed'))) {
-      await this.closeRoom(ws, 'Peer left');
+    const meta = ws.deserializeAttachment?.() || { shortCode: false };
+    if (meta.shortCode || !(await this.ctx.storage.get('closed'))) {
+      await this.closeRoom(ws, 'Peer left', meta.shortCode);
     }
   }
 
   async webSocketError(ws) {
-    if (!(await this.ctx.storage.get('closed'))) {
-      await this.closeRoom(ws, 'Peer error');
+    const meta = ws.deserializeAttachment?.() || { shortCode: false };
+    if (meta.shortCode || !(await this.ctx.storage.get('closed'))) {
+      await this.closeRoom(ws, 'Peer error', meta.shortCode);
     }
   }
 
   async alarm() {
-    const alreadyClosed = await this.ctx.storage.get('closed');
-    if (alreadyClosed) {
+    const sockets = this.ctx.getWebSockets();
+    const isShortCode = sockets.some(ws => ws.deserializeAttachment?.()?.shortCode);
+
+    if (!isShortCode && (await this.ctx.storage.get('closed'))) {
       await this.ctx.storage.deleteAll();
       return;
     }
 
-    await this.ctx.storage.put('closed', true);
-    for (const ws of this.ctx.getWebSockets()) {
+    const reason = isShortCode && sockets.length < 2 ? 'Code expired' : 'Room expired';
+    for (const ws of sockets) {
       try {
-        ws.send(JSON.stringify({ type: 'peer-left', reason: 'Room expired' }));
+        ws.send(JSON.stringify({ type: 'peer-left', reason }));
       } catch {}
       try {
-        ws.close(1000, 'Room expired');
+        ws.close(1000, reason);
       } catch {}
     }
-    await this.ctx.storage.setAlarm(Date.now() + CLOSED_RETENTION_MS);
+
+    if (isShortCode) {
+      await this.ctx.storage.deleteAll();
+    } else {
+      await this.ctx.storage.put('closed', true);
+      await this.ctx.storage.setAlarm(Date.now() + CLOSED_RETENTION_MS);
+    }
   }
 }

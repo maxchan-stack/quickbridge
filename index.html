@@ -7,7 +7,7 @@
   <meta name="referrer" content="no-referrer">
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self' wss://quickbridge-signal.maxgdodo.workers.dev https://quickbridge-signal.maxgdodo.workers.dev ws://localhost:* http://localhost:* ws://127.0.0.1:* http://127.0.0.1:*; object-src 'none'; base-uri 'self'">
   <title>QuickBridge｜跨裝置加密傳檔</title>
-  <link rel="stylesheet" href="style.css?v=v2">
+  <link rel="stylesheet" href="style.css?v=v3">
 </head>
 <body>
 <main id="app">
@@ -19,7 +19,7 @@
 
   <section id="setup">
     <div id="joinPrompt" class="panel join-prompt" hidden>
-      <h2>加入加密傳輸房間</h2>
+      <h2 id="joinPromptTitle">加入加密傳輸房間</h2>
       <p>點擊下方按鈕連線，並與發起端核對 8 碼驗證碼。</p>
       <button id="joinRoomBtn">加入加密房間</button>
     </div>
@@ -27,18 +27,28 @@
     <div class="intro">
       <div>
         <h1>跨裝置傳檔<span>。</span></h1>
-        <p>在這台裝置建立加密房間，用手機掃碼即可雙向傳送文字與檔案。</p>
+        <p>在這台裝置建立加密房間，用手機掃碼或輸入 6 位數短碼即可雙向傳送文字與檔案。</p>
       </div>
       <div class="devices" aria-hidden="true">
         <i class="laptop"></i><b>⇄</b><i class="phone"></i>
       </div>
     </div>
 
-    <div class="choices mode-picker">
+    <div class="choices">
       <article class="choice primary">
-        <h2>加密中繼房間</h2>
-        <p>支援校園網路與手機 4G／5G 跨網傳輸。檔案於瀏覽器端完成 AES-GCM 加密，單檔上限 20 MB，單房雙向各 60 MB。</p>
+        <h2>建立加密房間</h2>
+        <p>支援校園網路與手機 4G／5G 跨網傳輸。瀏覽器端 AES-GCM 加密，單檔上限 20 MB，單房雙向各 60 MB。</p>
         <button id="createRelay">建立加密傳輸房間 <span aria-hidden="true">↗</span></button>
+      </article>
+
+      <article class="choice">
+        <h2>輸入 6 位數配對碼加入</h2>
+        <p>不方便掃描 QR Code 時，直接輸入另一台裝置畫面上的 6 位數短碼即可連線。</p>
+        <form id="codeForm" class="code-form">
+          <input id="codeInput" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="7" placeholder="例如 482-915" aria-label="6 位數配對碼">
+          <button id="joinByCode" type="submit" class="secondary">加入房間</button>
+        </form>
+        <small id="codeError" class="error-text" role="alert"></small>
       </article>
     </div>
   </section>
@@ -53,6 +63,10 @@
     <div id="invitation" class="invitation">
       <div id="qr"></div>
       <div class="invite-actions">
+        <div id="shortCodeBox" class="short-code-box" hidden>
+          <span class="short-code-label">6 位數配對碼（5 分鐘內有效）</span>
+          <strong id="shortCodeText" class="short-code-value"></strong>
+        </div>
         <button id="copyInvite" class="secondary">複製邀請連結</button>
         <details id="inviteDetails">
           <summary>顯示完整連結</summary>
@@ -79,11 +93,12 @@
       <article class="panel" id="filePanel">
         <h2><label for="file">傳送檔案</label></h2>
         <div id="dropzone" class="dropzone">
-          <input id="file" type="file">
-          <p id="fileMeta" class="muted">點擊選取檔案，或將檔案拖放到這裡（單檔上限 20 MB）</p>
+          <input id="file" type="file" multiple>
+          <p id="fileMeta" class="muted">點擊選取一或多個檔案，或將檔案拖放到這裡（單檔上限 20 MB）</p>
         </div>
         <button id="sendFile">傳送檔案</button>
         <progress id="progress" aria-label="檔案送出進度" max="100" value="0"></progress>
+        <small id="progressText" class="muted"></small>
       </article>
 
       <article class="panel">
@@ -108,7 +123,7 @@
 </main>
 
 <script src="vendor/qrcode.min.js?v=1"></script>
-<script src="config.js?v=2"></script>
-<script src="app.js?v=2"></script>
+<script src="config.js?v=3"></script>
+<script src="app.js?v=3"></script>
 </body>
 </html>
